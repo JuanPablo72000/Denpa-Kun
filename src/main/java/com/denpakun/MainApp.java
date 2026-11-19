@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Locale;
@@ -25,6 +27,7 @@ import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.control.Button;
 import javafx.scene.control.CheckBox;
+import javafx.scene.control.ComboBox;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
@@ -42,6 +45,7 @@ import javafx.scene.input.KeyEvent;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
@@ -57,6 +61,7 @@ public final class MainApp extends Application {
     private static final byte[] SILENCE = new byte[AudioEngine.FRAME_BYTES];
     private static final int LOG_LIMIT = 200;
     private static final String TALKING_STYLE = "talking";
+    private static final String LOSS_STYLE = "has-loss";
     private static final Color VOICE_COLOR = Color.web("#69dfbe");
     private static final Color CARRIER_COLOR = Color.web("#eab572");
 
@@ -68,6 +73,7 @@ public final class MainApp extends Application {
     private final TextField peerInput = new TextField();
     private final Button connect = new Button("Conectar");
     private final Button ptt = new Button("Mantén pulsado para hablar");
+    private final ComboBox<SignalModulator.Mode> modulation = new ComboBox<>();
     private final Button chooseImage = new Button("Abrir imagen");
     private final Button sendImage = new Button("Enviar imagen");
     private final Label channel = new Label("Sin enlace");
@@ -80,6 +86,9 @@ public final class MainApp extends Application {
     private final ListView<LogEntry> events = new ListView<>();
     private final SignalScope voice = new SignalScope(VOICE_COLOR);
     private final SignalScope carrier = new SignalScope(CARRIER_COLOR);
+    private final Label carrierLabel = new Label();
+    private final ReceptionStrip receptionStrip = new ReceptionStrip();
+    private final Label receptionStatus = new Label();
     private final Label sent = new Label("0");
     private final Label received = new Label("0");
     private final Label missing = new Label("0");
@@ -87,6 +96,7 @@ public final class MainApp extends Application {
     private final Label corrupt = new Label("0");
     private final Label jitter = new Label("0.0 ms");
     private final BitSet decodedRows = new BitSet(SstvCodec.HEIGHT);
+    private final BitSet affectedRows = new BitSet(SstvCodec.HEIGHT);
     private Timeline dashboard;
     private Connection connection;
     private Connection voiceGesture;
@@ -130,10 +140,11 @@ public final class MainApp extends Application {
         root.setTop(header);
         root.setCenter(scroll);
 
-        Scene scene = new Scene(root, 1060, 810);
+        Scene scene = new Scene(root, 1060, 870);
         scene.getStylesheets().add(Objects.requireNonNull(getClass().getResource("styles.css")).toExternalForm());
         setupPtt(scene, stage);
         refreshControls();
+        updateDashboard();
         dashboard = new Timeline(new KeyFrame(Duration.millis(50), event -> updateDashboard()));
         dashboard.setCycleCount(Timeline.INDEFINITE);
         dashboard.play();
@@ -155,11 +166,25 @@ public final class MainApp extends Application {
         connect.setOnAction(event -> toggleConnection());
         HBox.setHgrow(peerInput, Priority.ALWAYS);
         HBox endpoint = new HBox(8, peerInput, connect);
+        Label modulationLabel = new Label("Modulación de voz");
+        modulationLabel.setLabelFor(modulation);
+        modulationLabel.getStyleClass().add("muted");
+        modulation.getItems().setAll(SignalModulator.Mode.values());
+        modulation.setValue(SignalModulator.Mode.DSB_SC);
+        modulation.setMaxWidth(Double.MAX_VALUE);
+        modulation.setTooltip(new Tooltip());
+        modulation.getTooltip().setText(modulation.getValue().description());
+        modulation.valueProperty().addListener((observable, before, mode) -> {
+            if (mode != null) {
+                modulation.getTooltip().setText(mode.description());
+                updateDashboard();
+            }
+        });
         ptt.setMaxWidth(Double.MAX_VALUE);
         ptt.getStyleClass().add("ptt");
         Label hint = new Label("Atajo · Barra espaciadora");
         hint.getStyleClass().add("muted");
-        return panel("Enlace de voz", peerLabel, endpoint, ptt, hint);
+        return panel("Enlace de voz", peerLabel, endpoint, new VBox(4, modulationLabel, modulation), ptt, hint);
     }
 
     private VBox buildFaultPanel() {
@@ -205,12 +230,17 @@ public final class MainApp extends Application {
     private VBox buildSignalPanel() {
         HBox metrics = new HBox(6, metric("Enviados", sent, "Datagramas enviados por UDP"),
                 metric("Válidos", received, "Datagramas recibidos con CRC válido"),
-                metric("Simulados", dropped, "Datagramas descartados en este emisor"),
-                metric("Faltantes", missing, "Saltos de secuencia de tramas recibidas"),
+                metric("Descartes TX", dropped, "Datagramas descartados por el simulador en este emisor"),
+                metric("Perdidos", missing, "Tramas de voz o SSTV ausentes tras esperar el reordenamiento"),
                 metric("Corruptos", corrupt, "Datagramas recibidos con CRC incorrecto"),
                 metric("Jitter RX", jitter, "Variación estimada del espaciado entre tramas recibidas"));
-        return panel("Osciloscopio", metrics, scope("Voz en banda base", voice, "voice-label"),
-                scope("Portadora modulada / tonos SSTV", carrier, "carrier-label"));
+        receptionStatus.getStyleClass().add("reception-status");
+        HBox key = new HBox(12, legend("Válida", "frame-valid"), legend("Perdida", "frame-lost"),
+                legend("CRC incorrecto", "frame-corrupt"));
+        VBox reception = new VBox(4, receptionStatus, receptionStrip, key);
+        Tooltip.install(receptionStrip, new Tooltip("Últimas 80 tramas de la recepción. Cada bloque abarca 20 ms."));
+        return panel("Osciloscopio", metrics, scope(new Label("Voz en banda base"), voice, "voice-label"),
+                scope(carrierLabel, carrier, "carrier-label"), reception);
     }
 
     private VBox buildImagePanel(Stage stage) {
@@ -224,6 +254,10 @@ public final class MainApp extends Application {
         imageProgress.setMaxWidth(Double.MAX_VALUE);
         VBox transmit = imageTile("Vista previa", outgoingPreview, "Sin imagen", imageInfo);
         VBox receive = imageTile("Recepción", incomingPreview, "Sin imagen", receiveInfo);
+        receiveInfo.getStyleClass().add("image-receive-info");
+        FlowPane imageKey = new FlowPane(10, 3, legend("Píxeles sin datos", "frame-lost"),
+                legend("Sin pulso de sincronía", "frame-corrupt"));
+        receive.getChildren().add(imageKey);
         HBox images = new HBox(10, transmit, receive);
         HBox.setHgrow(transmit, Priority.ALWAYS);
         HBox.setHgrow(receive, Priority.ALWAYS);
@@ -242,7 +276,7 @@ public final class MainApp extends Application {
         screen.setMinHeight(144);
         screen.getStyleClass().add("image-screen");
         caption.getStyleClass().add("muted");
-        caption.setMaxWidth(212);
+        caption.setWrapText(true);
         caption.setTooltip(new Tooltip());
         caption.getTooltip().textProperty().bind(caption.textProperty());
         VBox tile = new VBox(5, new Label(title), screen, caption);
@@ -269,10 +303,19 @@ public final class MainApp extends Application {
         return new VBox(4, new HBox(4, label, spacer, value), slider);
     }
 
-    private static VBox scope(String title, SignalScope scope, String colorClass) {
-        Label label = new Label(title);
+    private static VBox scope(Label label, SignalScope scope, String colorClass) {
         label.getStyleClass().add(colorClass);
         return new VBox(4, label, scope);
+    }
+
+    private static HBox legend(String title, String colorClass) {
+        Region dot = new Region();
+        dot.getStyleClass().addAll("legend-dot", colorClass);
+        Label label = new Label(title);
+        label.getStyleClass().add("muted");
+        HBox item = new HBox(5, dot, label);
+        item.setAlignment(Pos.CENTER_LEFT);
+        return item;
     }
 
     private static VBox metric(String title, Label value, String description) {
@@ -335,7 +378,8 @@ public final class MainApp extends Application {
         scene.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
             if (event.getCode() == KeyCode.SPACE && (spaceHeld || scene.getFocusOwner() == ptt
                     || !(scene.getFocusOwner() instanceof TextInputControl
-                    || scene.getFocusOwner() instanceof Button || scene.getFocusOwner() instanceof CheckBox))) {
+                    || scene.getFocusOwner() instanceof Button || scene.getFocusOwner() instanceof CheckBox
+                    || scene.getFocusOwner() instanceof ComboBox<?>))) {
                 event.consume();
                 if (!spaceHeld) {
                     spaceHeld = true;
@@ -384,6 +428,7 @@ public final class MainApp extends Application {
                 || current.radio.state() != ChannelState.IDLE) {
             return;
         }
+        SignalModulator.Mode mode = modulation.getValue();
         UdpTransceiver.FrameSource source = new UdpTransceiver.FrameSource() {
             private boolean started;
 
@@ -396,8 +441,8 @@ public final class MainApp extends Application {
                 AudioEngine.CapturedFrame capture = current.audio.pollCapture();
                 byte[] pcm = capture == null ? SILENCE : capture.pcm();
                 long timestamp = capture == null ? System.nanoTime() : capture.timestampNanos();
-                byte[] encoded = SignalModulator.modulate(pcm);
-                current.waveforms = new Waveforms(pcm, encoded);
+                byte[] encoded = SignalModulator.modulate(pcm, mode);
+                current.waveforms = new Waveforms(capture == null ? null : pcm, encoded, mode);
                 return new UdpTransceiver.CapturedFrame(encoded, timestamp);
             }
 
@@ -406,7 +451,7 @@ public final class MainApp extends Application {
                 current.audio.stopCapture();
             }
         };
-        if (current.radio.startTransmission(UdpTransceiver.FrameType.AUDIO_FRAME, source)) {
+        if (current.radio.startTransmission(UdpTransceiver.FrameType.AUDIO_FRAME, mode, source)) {
             voiceGesture = current;
         } else {
             appendLog("Canal ocupado. Vuelve a pulsar para transmitir.", false);
@@ -483,7 +528,7 @@ public final class MainApp extends Application {
                 return null;
             }
             byte[] block = frames.get(index);
-            current.waveforms = new Waveforms(null, block);
+            current.waveforms = new Waveforms(null, block, null);
             current.imageFrame = index + 1;
             return new UdpTransceiver.CapturedFrame(block, System.nanoTime());
         };
@@ -505,6 +550,7 @@ public final class MainApp extends Application {
         boolean sending = ready && state == ChannelState.TRANSMITTING && current.sendingImage;
         peerInput.setDisable(current != null);
         connect.setText(current == null ? "Conectar" : ready ? "Desconectar" : "Cancelar");
+        modulation.setDisable(state != ChannelState.IDLE);
         ptt.setDisable(!ready || state == ChannelState.RECEIVING || (state == ChannelState.TRANSMITTING && !talking));
         var pttStyles = ptt.getStyleClass();
         if (talking && !pttStyles.contains(TALKING_STYLE)) {
@@ -531,10 +577,23 @@ public final class MainApp extends Application {
         Waveforms sample = current == null ? null : current.waveforms;
         voice.display(sample == null ? null : sample.baseband());
         carrier.display(sample == null ? null : sample.carrier());
+        ReceptionHistory history = current == null ? null : current.receptionHistory;
+        ReceptionSnapshot reception = history == null ? null : history.snapshot();
+        receptionStrip.display(reception);
+        receptionStatus.setText(reception == null ? "Recepción · En espera de tramas" : reception.summary());
+        setLossHighlight(receptionStatus, reception != null && reception.lost() > 0);
+        SignalModulator.Mode mode = modulation.getValue();
+        if (sample != null) {
+            mode = sample.mode();
+        } else if (history != null && current.radio != null && current.radio.state() == ChannelState.RECEIVING) {
+            mode = history.mode;
+        }
+        carrierLabel.setText(mode == null ? "Tonos SSTV" : "Señal modulada · " + mode.displayName());
         if (current == null || current.radio == null) {
             sent.setText("0");
             received.setText("0");
             missing.setText("0");
+            setLossHighlight(missing, false);
             dropped.setText("0");
             corrupt.setText("0");
             jitter.setText("0.0 ms");
@@ -544,6 +603,7 @@ public final class MainApp extends Application {
         sent.setText(Long.toString(stats.sent()));
         received.setText(Long.toString(stats.received()));
         missing.setText(Long.toString(stats.missing()));
+        setLossHighlight(missing, stats.missing() > 0);
         dropped.setText(Long.toString(stats.dropped()));
         jitter.setText(String.format(Locale.forLanguageTag("es-MX"), "%.1f ms", stats.jitterMillis()));
         if (current.sendingImage && preparedImage != null) {
@@ -557,6 +617,21 @@ public final class MainApp extends Application {
         }
         events.getItems().add(new LogEntry(LocalTime.now().format(TIME), message, warning));
         events.scrollTo(events.getItems().size() - 1);
+    }
+
+    private void showImageStatus(boolean incomplete) {
+        receiveInfo.setText(decodedRows.cardinality() + " / " + SstvCodec.HEIGHT + " líneas con datos · "
+                + affectedRows.cardinality() + " afectadas" + (incomplete ? " · Incompleta" : ""));
+        setLossHighlight(receiveInfo, !affectedRows.isEmpty());
+    }
+
+    private static void setLossHighlight(Label label, boolean highlighted) {
+        var styles = label.getStyleClass();
+        if (highlighted && !styles.contains(LOSS_STYLE)) {
+            styles.add(LOSS_STYLE);
+        } else if (!highlighted) {
+            styles.remove(LOSS_STYLE);
+        }
     }
 
     @Override
@@ -578,19 +653,22 @@ public final class MainApp extends Application {
         private volatile UdpTransceiver radio;
         private String peerAddress;
         private volatile Waveforms waveforms;
+        private volatile ReceptionHistory receptionHistory;
         private volatile int imageFrame;
         private boolean sendingImage;
         private boolean playing;
         private SstvCodec.Decoder decoder;
+        private int lastImageSequence;
 
         @Override
         public void onStateChanged(ChannelState state) {
             boolean finishedImageReception = state == ChannelState.IDLE && decoder != null;
+            boolean incompleteImage = lastImageSequence < SstvCodec.IMAGE_FRAMES;
             if (state == ChannelState.RECEIVING) {
                 audio.stopPlayback();
                 playing = false;
-                decoder = null;
             } else {
+                decoder = null;
                 if (state == ChannelState.IDLE && playing) {
                     audio.finishPlayback();
                     playing = false;
@@ -601,8 +679,8 @@ public final class MainApp extends Application {
             }
             waveforms = null;
             show(() -> {
-                if (finishedImageReception && decodedRows.isEmpty()) {
-                    receiveInfo.setText("Sin líneas recuperadas");
+                if (finishedImageReception) {
+                    showImageStatus(incompleteImage);
                 }
                 if (state != ChannelState.TRANSMITTING
                         && (radio == null || radio.state() != ChannelState.TRANSMITTING)) {
@@ -619,35 +697,68 @@ public final class MainApp extends Application {
         }
 
         @Override
-        public void onFrame(UdpTransceiver.FrameType type, int sequence, byte[] payload) {
+        public void onSessionStarted(UdpTransceiver.FrameType type, SignalModulator.Mode mode) {
+            boolean image = type == UdpTransceiver.FrameType.SSTV_FRAME;
+            receptionHistory = new ReceptionHistory(image ? "SSTV" : "Voz", image ? null : mode);
+            if (image) {
+                decoder = new SstvCodec.Decoder();
+                lastImageSequence = 0;
+                show(() -> {
+                    decodedRows.clear();
+                    affectedRows.clear();
+                    incomingImage = new WritableImage(SstvCodec.WIDTH, SstvCodec.HEIGHT);
+                    incomingPreview.setImage(incomingImage);
+                    showImageStatus(false);
+                });
+            }
+        }
+
+        @Override
+        public void onFrame(UdpTransceiver.FrameType type, int sequence, byte[] payload, SignalModulator.Mode mode) {
+            receptionHistory.add(FrameStatus.VALID, 1);
             if (type == UdpTransceiver.FrameType.AUDIO_FRAME) {
-                byte[] pcm = SignalModulator.demodulate(payload);
-                waveforms = new Waveforms(pcm, payload);
+                byte[] pcm = SignalModulator.demodulate(payload, mode);
+                waveforms = new Waveforms(pcm, payload, mode);
                 play(pcm);
             } else if (type == UdpTransceiver.FrameType.SSTV_FRAME) {
-                waveforms = new Waveforms(null, payload);
+                waveforms = new Waveforms(null, payload, null);
                 if (listenToTones) {
                     play(payload);
                 } else if (playing) {
                     audio.stopPlayback();
                     playing = false;
                 }
-                if (decoder == null) {
-                    decoder = new SstvCodec.Decoder();
-                    show(() -> {
-                        decodedRows.clear();
-                        incomingImage = new WritableImage(SstvCodec.WIDTH, SstvCodec.HEIGHT);
-                        incomingPreview.setImage(incomingImage);
-                        receiveInfo.setText("Recibiendo líneas…");
-                    });
-                }
-                decoder.accept(sequence - 1, payload, line -> show(() -> {
+                lastImageSequence = sequence;
+                List<SstvCodec.DecodedLine> lines = new ArrayList<>();
+                decoder.accept(sequence - 1, payload, lines::add);
+                showImageLines(lines);
+            }
+        }
+
+        @Override
+        public void onFrameGap(UdpTransceiver.FrameType type, int firstSequence, int frameCount, boolean corrupt) {
+            receptionHistory.add(corrupt ? FrameStatus.CORRUPT : FrameStatus.LOST, frameCount);
+            if (type == UdpTransceiver.FrameType.SSTV_FRAME) {
+                lastImageSequence = firstSequence + frameCount - 1;
+                List<SstvCodec.DecodedLine> lines = new ArrayList<>();
+                decoder.markUnavailable(firstSequence - 1, frameCount, lines::add);
+                showImageLines(lines);
+            }
+        }
+
+        private void showImageLines(List<SstvCodec.DecodedLine> lines) {
+            if (lines.isEmpty()) {
+                return;
+            }
+            show(() -> {
+                for (SstvCodec.DecodedLine line : lines) {
                     incomingImage.getPixelWriter().setPixels(0, line.row(), SstvCodec.WIDTH, 1,
                             PixelFormat.getIntArgbInstance(), line.argb(), 0, SstvCodec.WIDTH);
-                    decodedRows.set(line.row());
-                    receiveInfo.setText(decodedRows.cardinality() + " / " + SstvCodec.HEIGHT + " líneas");
-                }));
-            }
+                    decodedRows.set(line.row(), line.decodedPixels() > 0);
+                    affectedRows.set(line.row(), line.unavailablePixels() > 0 || line.missingSync());
+                }
+                showImageStatus(false);
+            });
         }
 
         private void play(byte[] pcm) {
@@ -704,9 +815,98 @@ public final class MainApp extends Application {
         }
     }
 
-    private record Waveforms(byte[] baseband, byte[] carrier) {}
+    private record Waveforms(byte[] baseband, byte[] carrier, SignalModulator.Mode mode) {}
     private record LogEntry(String time, String text, boolean warning) {}
     private record PreparedImage(String name, BufferedImage preview, List<byte[]> frames) {}
+
+    private enum FrameStatus {
+        VALID("#69dfbe"), LOST("#ff4ca8"), CORRUPT("#ffc45a");
+
+        private final Color color;
+
+        FrameStatus(String color) {
+            this.color = Color.web(color);
+        }
+    }
+
+    private record ReceptionSnapshot(String summary, long lost, List<FrameStatus> frames) {}
+
+    private static final class ReceptionHistory {
+        private static final int VISIBLE_FRAMES = 80;
+
+        private final String media;
+        private final SignalModulator.Mode mode;
+        private final ArrayDeque<FrameStatus> frames = new ArrayDeque<>(VISIBLE_FRAMES);
+        private long lost;
+        private long corrupt;
+        private ReceptionSnapshot snapshot;
+
+        ReceptionHistory(String media, SignalModulator.Mode mode) {
+            this.media = media;
+            this.mode = mode;
+        }
+
+        synchronized void add(FrameStatus status, int count) {
+            switch (status) {
+                case LOST -> lost += count;
+                case CORRUPT -> corrupt += count;
+                case VALID -> { }
+            }
+            int visible = Math.min(VISIBLE_FRAMES, count);
+            while (frames.size() + visible > VISIBLE_FRAMES) {
+                frames.removeFirst();
+            }
+            for (int index = 0; index < visible; index++) {
+                frames.addLast(status);
+            }
+            snapshot = null;
+        }
+
+        synchronized ReceptionSnapshot snapshot() {
+            if (snapshot == null) {
+                snapshot = new ReceptionSnapshot(media + " · " + lost + " perdidas · " + corrupt
+                        + " con CRC incorrecto", lost, List.copyOf(frames));
+            }
+            return snapshot;
+        }
+    }
+
+    private static final class ReceptionStrip extends Region {
+        private static final Color EMPTY = Color.web("#263a3f");
+        private final Canvas canvas = new Canvas();
+        private ReceptionSnapshot reception;
+
+        ReceptionStrip() {
+            setMinHeight(14);
+            setPrefHeight(14);
+            getChildren().add(canvas);
+        }
+
+        void display(ReceptionSnapshot next) {
+            if (reception != next) {
+                reception = next;
+                draw();
+            }
+        }
+
+        @Override
+        protected void layoutChildren() {
+            canvas.setWidth(getWidth());
+            canvas.setHeight(getHeight());
+            draw();
+        }
+
+        private void draw() {
+            double cell = canvas.getWidth() / ReceptionHistory.VISIBLE_FRAMES;
+            GraphicsContext graphics = canvas.getGraphicsContext2D();
+            graphics.clearRect(0, 0, canvas.getWidth(), canvas.getHeight());
+            List<FrameStatus> frames = reception == null ? List.of() : reception.frames();
+            for (int index = 0; index < ReceptionHistory.VISIBLE_FRAMES; index++) {
+                graphics.setFill(index < frames.size() ? frames.get(index).color : EMPTY);
+                graphics.fillRoundRect(index * cell, 0, Math.max(0, cell - 1), canvas.getHeight(), 2, 2);
+            }
+        }
+    }
 
     private static final class SignalScope extends Region {
         private final Canvas canvas = new Canvas();

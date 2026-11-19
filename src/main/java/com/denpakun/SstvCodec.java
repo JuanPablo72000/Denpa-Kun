@@ -22,12 +22,16 @@ public final class SstvCodec {
     private static final int PIXELS_PER_FRAME = FRAME_SAMPLES / PIXEL_SAMPLES;
     private static final int LINE_FRAMES = 1 + WIDTH / PIXELS_PER_FRAME;
     private static final int VERTICAL_SYNC_FRAMES = 2;
-    private static final int IMAGE_FRAMES = VERTICAL_SYNC_FRAMES + HEIGHT * LINE_FRAMES;
+    public static final int IMAGE_FRAMES = VERTICAL_SYNC_FRAMES + HEIGHT * LINE_FRAMES;
     private static final double SYNC_HZ = 1_200;
     private static final double BLACK_HZ = 1_500;
     private static final double WHITE_HZ = 2_300;
     private static final double TONE_TOLERANCE_HZ = 60;
     private static final int OPAQUE_BLACK = 0xff000000;
+    private static final int LOSS_LIGHT = 0xffff4ca8;
+    private static final int LOSS_DARK = 0xff75254f;
+    private static final int MISSING_SYNC = 0xffffc45a;
+    private static final int SYNC_MARKER_WIDTH = 8;
     private static final int AMPLITUDE = 24_000;
 
     private SstvCodec() { }
@@ -79,12 +83,15 @@ public final class SstvCodec {
         return List.copyOf(frames);
     }
 
-    public record DecodedLine(int row, int[] argb) { }
+    public record DecodedLine(int row, int[] argb, int decodedPixels, int unavailablePixels,
+                              boolean missingSync) { }
 
     /** Receives blocks by their original position so lost blocks never shift the scan. */
     public static final class Decoder {
         private final int[][] lines = new int[HEIGHT][];
+        private final int[] decodedPixels = new int[HEIGHT];
         private final BitSet received = new BitSet(IMAGE_FRAMES);
+        private final BitSet unavailable = new BitSet(IMAGE_FRAMES);
         private final BitSet rejectedLines = new BitSet(HEIGHT);
         private boolean rejectedImage;
 
@@ -92,7 +99,7 @@ public final class SstvCodec {
             Objects.requireNonNull(pcm, "pcm");
             Objects.requireNonNull(onLine, "onLine");
             if (rejectedImage || frameIndex < 0 || frameIndex >= IMAGE_FRAMES
-                    || pcm.length != FRAME_BYTES || received.get(frameIndex)) {
+                    || pcm.length != FRAME_BYTES || received.get(frameIndex) || unavailable.get(frameIndex)) {
                 return;
             }
             received.set(frameIndex);
@@ -119,6 +126,26 @@ public final class SstvCodec {
             }
         }
 
+        /** Marks a confirmed gap using the same zero-based scan positions as accept. */
+        public void markUnavailable(int firstFrameIndex, int frameCount, Consumer<DecodedLine> onLine) {
+            Objects.requireNonNull(onLine, "onLine");
+            if (firstFrameIndex < 0 || firstFrameIndex >= IMAGE_FRAMES || frameCount <= 0) {
+                return;
+            }
+            BitSet affectedRows = new BitSet(HEIGHT);
+            int end = firstFrameIndex + Math.min(frameCount, IMAGE_FRAMES - firstFrameIndex);
+            for (int frame = firstFrameIndex; frame < end; frame++) {
+                if (!received.get(frame) && !unavailable.get(frame)) {
+                    unavailable.set(frame);
+                    int row = Math.max(0, frame - VERTICAL_SYNC_FRAMES) / LINE_FRAMES;
+                    affectedRows.set(row);
+                }
+            }
+            for (int row = affectedRows.nextSetBit(0); row >= 0; row = affectedRows.nextSetBit(row + 1)) {
+                onLine.accept(snapshot(row));
+            }
+        }
+
         private void decodePixels(int row, int start, byte[] pcm, Consumer<DecodedLine> onLine) {
             int[] line = lines[row];
             if (line == null) {
@@ -131,16 +158,48 @@ public final class SstvCodec {
                         && frequency <= WHITE_HZ + TONE_TOLERANCE_HZ) {
                     int gray = (int) Math.round(255 * (frequency - BLACK_HZ) / (WHITE_HZ - BLACK_HZ));
                     line[start + pixel] = grayArgb(Math.clamp(gray, 0, 255));
+                    decodedPixels[row]++;
                 }
             }
-            onLine.accept(new DecodedLine(row, line.clone()));
+            onLine.accept(snapshot(row));
         }
 
         private void clearLine(int row, Consumer<DecodedLine> onLine) {
             if (lines[row] != null) {
                 lines[row] = null;
-                onLine.accept(new DecodedLine(row, emptyLine()));
+                decodedPixels[row] = 0;
+                onLine.accept(snapshot(row));
             }
+        }
+
+        private DecodedLine snapshot(int row) {
+            int[] display = lines[row] == null ? emptyLine() : lines[row].clone();
+            int syncFrame = VERTICAL_SYNC_FRAMES + row * LINE_FRAMES;
+            boolean missingSync = unavailable.get(syncFrame);
+            if (missingSync) {
+                Arrays.fill(display, WIDTH - SYNC_MARKER_WIDTH, WIDTH, MISSING_SYNC);
+            }
+            if (row == 0) {
+                for (int frame = 0; frame < VERTICAL_SYNC_FRAMES; frame++) {
+                    if (unavailable.get(frame)) {
+                        int start = frame * SYNC_MARKER_WIDTH;
+                        Arrays.fill(display, start, start + SYNC_MARKER_WIDTH, MISSING_SYNC);
+                        missingSync = true;
+                    }
+                }
+            }
+
+            int unavailablePixels = 0;
+            for (int frame = 1; frame < LINE_FRAMES; frame++) {
+                if (unavailable.get(syncFrame + frame)) {
+                    int start = (frame - 1) * PIXELS_PER_FRAME;
+                    for (int x = start; x < start + PIXELS_PER_FRAME; x++) {
+                        display[x] = (x / 4 + row) % 2 == 0 ? LOSS_LIGHT : LOSS_DARK;
+                    }
+                    unavailablePixels += PIXELS_PER_FRAME;
+                }
+            }
+            return new DecodedLine(row, display, decodedPixels[row], unavailablePixels, missingSync);
         }
     }
 

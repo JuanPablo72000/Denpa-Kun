@@ -140,7 +140,26 @@
     -fx-text-fill: #edf8f5;
 }
 
-.button:focused, .button.primary-button:focused, .text-field:focused {
+.combo-box {
+    -fx-background-color: #0e191d;
+    -fx-background-insets: 0;
+    -fx-background-radius: 5;
+    -fx-border-color: #3a5357;
+    -fx-border-radius: 5;
+    -fx-padding: 2 4;
+}
+
+.combo-box > .list-cell {
+    -fx-background-color: transparent;
+    -fx-text-fill: #edf8f5;
+    -fx-font-size: 13px;
+}
+
+.combo-box > .arrow-button > .arrow {
+    -fx-background-color: #a3b7b9;
+}
+
+.button:focused, .button.primary-button:focused, .text-field:focused, .combo-box:focused {
     -fx-border-color: #d4f9ec;
 }
 
@@ -189,6 +208,36 @@
     -fx-font-family: "Consolas";
     -fx-font-weight: bold;
     -fx-text-fill: #d4e9e5;
+}
+
+.reception-status {
+    -fx-font-size: 12px;
+    -fx-text-fill: #d4e9e5;
+}
+
+.label.has-loss {
+    -fx-text-fill: #ff95cb;
+    -fx-font-weight: bold;
+}
+
+.legend-dot {
+    -fx-min-width: 8;
+    -fx-min-height: 8;
+    -fx-pref-height: 8;
+    -fx-max-height: 8;
+    -fx-background-radius: 2;
+}
+
+.frame-valid {
+    -fx-background-color: #69dfbe;
+}
+
+.frame-lost {
+    -fx-background-color: #ff4ca8;
+}
+
+.frame-corrupt {
+    -fx-background-color: #ffc45a;
 }
 
 .voice-label {

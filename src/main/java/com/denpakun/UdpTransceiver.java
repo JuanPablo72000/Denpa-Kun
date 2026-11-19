@@ -34,7 +34,14 @@ public final class UdpTransceiver implements AutoCloseable {
     private static final long MAX_SLEEP_NANOS = TimeUnit.MILLISECONDS.toNanos(8);
     private static final long SPIN_NANOS = TimeUnit.MICROSECONDS.toNanos(1_500);
     private static final int REORDER_CAPACITY = 16;
-    private static final byte[] CONTROL_PAYLOAD = new byte[PAYLOAD_BYTES];
+    private static final int MAX_CORRUPT_LEAD = REORDER_CAPACITY + (int) (WATCHDOG_NANOS / FRAME_NANOS);
+    private static final int CONTROL_MAGIC = 0x444E504B; // DNPK
+    private static final long VOICE_MODE_MARKER = 0xA9C6_31F2_6957_8EBCL;
+    private static final long VOICE_MODE_MASK = 3;
+    private static final long[] PAYLOAD_FLIP_SYNDROMES = payloadFlipSyndromes();
+    private static final MediaFormat DEFAULT_VOICE = new MediaFormat(
+            FrameType.AUDIO_FRAME, SignalModulator.Mode.DSB_SC);
+    private static final MediaFormat SSTV = new MediaFormat(FrameType.SSTV_FRAME, null);
 
     private final Object gate = new Object();
     private final DatagramSocket socket;
@@ -42,6 +49,7 @@ public final class UdpTransceiver implements AutoCloseable {
     private final FaultSimulator faults;
     private final Listener listener;
     private final Thread clock;
+    private final Deque<InboundPacket> unidentifiedCorrupt = new ArrayDeque<>();
 
     private volatile ChannelState state = ChannelState.IDLE;
     private boolean closed;
@@ -105,10 +113,17 @@ public final class UdpTransceiver implements AutoCloseable {
 
     /** Transfers ownership of the source if the channel is available. */
     public boolean startTransmission(FrameType type, FrameSource source) {
+        return startTransmission(type, SignalModulator.Mode.DSB_SC, source);
+    }
+
+    /** Voice uses the selected mode for this transmission. SSTV always sends its own FM tones. */
+    public boolean startTransmission(FrameType type, SignalModulator.Mode mode, FrameSource source) {
         Objects.requireNonNull(source, "source");
         if (!Objects.requireNonNull(type, "type").isMedia()) {
             throw new IllegalArgumentException("Se requiere un tipo de trama de audio o imagen");
         }
+        MediaFormat format = type == FrameType.AUDIO_FRAME
+                ? new MediaFormat(type, Objects.requireNonNull(mode, "mode")) : SSTV;
         synchronized (gate) {
             long now = System.nanoTime();
             if (closed || state != ChannelState.IDLE) {
@@ -119,9 +134,9 @@ public final class UdpTransceiver implements AutoCloseable {
                 return false;
             }
 
-            Transmission current = new Transmission(type, source, now);
+            Transmission current = new Transmission(format, source, now);
             transmission = current;
-            enqueue(current, FrameType.START_TX, 0, now, CONTROL_PAYLOAD);
+            enqueue(current, FrameType.START_TX, 0, now, current.controlPayload);
             changeState(ChannelState.TRANSMITTING);
             wakeClock();
             return true;
@@ -203,7 +218,7 @@ public final class UdpTransceiver implements AutoCloseable {
                 return;
             }
             int sequence = current.nextSequence++;
-            enqueue(current, current.type, sequence, frame.timestamp(), frame.payload());
+            enqueue(current, current.format.type(), sequence, frame.timestamp(), frame.payload());
             long now = System.nanoTime();
             long nextDeadline = current.nextCapture + FRAME_NANOS;
             current.nextCapture = nextDeadline - now > 0 ? nextDeadline : now + FRAME_NANOS;
@@ -218,7 +233,7 @@ public final class UdpTransceiver implements AutoCloseable {
             return;
         }
         releaseSource(current);
-        enqueue(current, FrameType.END_TX, current.nextSequence, System.nanoTime(), CONTROL_PAYLOAD);
+        enqueue(current, FrameType.END_TX, current.nextSequence, System.nanoTime(), current.controlPayload);
         completeTransmissionIfDrained(current);
     }
 
@@ -243,7 +258,7 @@ public final class UdpTransceiver implements AutoCloseable {
 
     private void enqueue(Transmission current, FrameType type, int sequence, long timestamp,
                          byte[] payload) {
-        byte[] bytes = encode(type, sequence, timestamp, payload);
+        byte[] bytes = encode(type, sequence, timestamp, payload, current.format.mode());
         FaultSimulator.Decision decision = faults.apply(bytes, HEADER_BYTES);
         if (decision.dropped()) {
             dropped++;
@@ -298,8 +313,8 @@ public final class UdpTransceiver implements AutoCloseable {
             if (!closed) {
                 heardPeer = true;
                 lastDatagram = now;
-                advanceReception(now);
                 receiveDatagram(bytes, length, now);
+                advanceReception(now);
             }
         }
     }
@@ -314,25 +329,35 @@ public final class UdpTransceiver implements AutoCloseable {
         int sequence = header.getInt();
         long timestamp = header.getLong();
         long checksum = header.getLong();
-        if (checksum != checksum(bytes)) {
+        boolean validHeader = type != null && (type == FrameType.START_TX ? sequence == 0 : sequence > 0)
+                && sequence != Integer.MAX_VALUE;
+        long actualChecksum = checksum(bytes);
+        if (checksum != actualChecksum) {
             listener.onCorruptPacket(++corrupt);
             listener.onEvent("CRC32 incorrecto en la trama " + sequence);
+            if (validHeader && type.isMedia()
+                    && Arrays.binarySearch(PAYLOAD_FLIP_SYNDROMES, checksum ^ actualChecksum) >= 0) {
+                rememberCorrupt(new InboundPacket(type, sequence, timestamp, now, null, null));
+            }
             return;
         }
-        if (type == null || (type == FrameType.START_TX ? sequence != 0 : sequence <= 0)
-                || sequence == Integer.MAX_VALUE) {
+        if (!validHeader) {
             listener.onEvent("Trama UDP descartada por cabecera inválida");
             return;
         }
         received++;
-        InboundPacket packet = new InboundPacket(type, sequence, timestamp, now,
-                type.isMedia() ? Arrays.copyOfRange(bytes, HEADER_BYTES, PACKET_BYTES) : null);
+        MediaFormat format = switch (type) {
+            case AUDIO_FRAME -> voiceFormat(bytes);
+            case SSTV_FRAME -> SSTV;
+            case START_TX, END_TX -> controlFormat(bytes);
+        };
+        byte[] payload = type.isMedia() ? Arrays.copyOfRange(bytes, HEADER_BYTES, PACKET_BYTES) : null;
+        InboundPacket packet = new InboundPacket(type, sequence, timestamp, now, payload, format);
         accept(packet);
     }
 
     private void accept(InboundPacket packet) {
-        if (completedReception && packet.arrivedAt() - lastReceptionEnd < WATCHDOG_NANOS
-                && packet.timestamp() <= lastRemoteTimestamp) {
+        if (isFromCompletedReception(packet)) {
             return;
         }
         if (transmission != null) {
@@ -346,10 +371,13 @@ public final class UdpTransceiver implements AutoCloseable {
             listener.onEvent("Colisión detectada. Se cedió el canal al otro equipo");
         }
         if (reception != null && startsNewReception(packet, reception)) {
-            finishReception(packet.arrivedAt());
+            drainReception(packet.arrivedAt(), true);
+            if (reception != null) {
+                finishReception(packet.arrivedAt());
+            }
         }
         if (reception == null) {
-            if (packet.type() == FrameType.END_TX) {
+            if (packet.type() == FrameType.END_TX && packet.format() == null) {
                 return;
             }
             reception = new Reception(packet);
@@ -361,21 +389,87 @@ public final class UdpTransceiver implements AutoCloseable {
                 reception.sawStart = true;
                 reception.startTimestamp = packet.timestamp();
                 reception.lastActivity = packet.arrivedAt();
+                identifyReception(packet);
             }
             return;
         }
+        InboundPacket previous = reception.pending.get(packet.sequence());
         if ((reception.sawStart && packet.timestamp() < reception.startTimestamp)
                 || packet.sequence() < reception.nextSequence
-                || reception.pending.containsKey(packet.sequence())) {
+                || (previous != null && !previous.isCorruptMedia())) {
             return;
         }
-        reception.lastActivity = packet.arrivedAt();
+        identifyReception(packet);
+        if (packet.format() != null && !packet.format().equals(reception.format)) {
+            listener.onEvent("Trama UDP descartada por cambio de formato durante la sesión");
+            return;
+        }
+        reception.lastActivity = Math.max(reception.lastActivity, packet.arrivedAt());
         reception.latestTimestamp = Math.max(reception.latestTimestamp, packet.timestamp());
         if (packet.type().isMedia()) {
             updateJitter(packet, reception);
         }
         reception.pending.put(packet.sequence(), packet);
-        advanceReception(packet.arrivedAt());
+    }
+
+    private void identifyReception(InboundPacket reference) {
+        if (reception.format != null || reference.format() == null) {
+            return;
+        }
+        reception.format = reference.format();
+        listener.onSessionStarted(reception.format.type(), reception.format.mode());
+        while (!unidentifiedCorrupt.isEmpty()) {
+            InboundPacket candidate = unidentifiedCorrupt.removeFirst();
+            long age = reference.arrivedAt() - candidate.arrivedAt();
+            if (age < WATCHDOG_NANOS && belongsWith(candidate, reference)) {
+                acceptCorrupt(candidate);
+            }
+        }
+    }
+
+    private static boolean belongsWith(InboundPacket candidate, InboundPacket reference) {
+        return switch (reference.type()) {
+            case START_TX -> candidate.timestamp() >= reference.timestamp();
+            case END_TX -> candidate.sequence() < reference.sequence()
+                    && candidate.timestamp() <= reference.timestamp();
+            case AUDIO_FRAME, SSTV_FRAME -> candidate.sequence() < reference.sequence()
+                    ? candidate.timestamp() <= reference.timestamp() + FRAME_NANOS
+                    : candidate.timestamp() >= reference.timestamp() - FRAME_NANOS;
+        };
+    }
+
+    private void rememberCorrupt(InboundPacket packet) {
+        if (transmission != null || isFromCompletedReception(packet)) {
+            return;
+        }
+        if (reception != null && reception.format != null) {
+            acceptCorrupt(packet);
+        } else {
+            if (unidentifiedCorrupt.size() == MAX_CORRUPT_LEAD) {
+                unidentifiedCorrupt.removeFirst();
+            }
+            unidentifiedCorrupt.addLast(packet);
+        }
+    }
+
+    private void acceptCorrupt(InboundPacket packet) {
+        // A failed CRC makes the header tentative. A nearby sequence, known format and
+        // session timestamp let us attribute a missing playback block to a rejected datagram.
+        if (packet.type() != reception.format.type()
+                || packet.sequence() < reception.nextSequence
+                || packet.sequence() - reception.nextSequence > MAX_CORRUPT_LEAD
+                || (reception.sawStart && packet.timestamp() < reception.startTimestamp)
+                || (reception.deliveredMedia && packet.timestamp() < reception.lastMediaTimestamp - FRAME_NANOS)) {
+            return;
+        }
+        if (reception.pending.putIfAbsent(packet.sequence(), packet) == null) {
+            reception.lastActivity = Math.max(reception.lastActivity, packet.arrivedAt());
+        }
+    }
+
+    private boolean isFromCompletedReception(InboundPacket packet) {
+        return completedReception && packet.arrivedAt() - lastReceptionEnd < WATCHDOG_NANOS
+                && packet.timestamp() <= lastRemoteTimestamp;
     }
 
     private boolean peerWins(InboundPacket packet, Transmission current) {
@@ -388,7 +482,7 @@ public final class UdpTransceiver implements AutoCloseable {
         // Both contenders need the original START timestamp, even if the first START was lost.
         if (!current.finished && now - current.lastClaimAt >= CSMA_NANOS) {
             current.lastClaimAt = now;
-            enqueue(current, FrameType.START_TX, 0, current.startedAt, CONTROL_PAYLOAD);
+            enqueue(current, FrameType.START_TX, 0, current.startedAt, current.controlPayload);
             wakeClock();
         }
     }
@@ -423,21 +517,38 @@ public final class UdpTransceiver implements AutoCloseable {
     }
 
     private void advanceReception(long now) {
+        drainReception(now, false);
+        if (reception != null && now - reception.lastActivity >= WATCHDOG_NANOS) {
+            finishReception(now);
+            listener.onEvent("Canal liberado tras 300 ms sin tramas de la sesión");
+        }
+    }
+
+    private void drainReception(long now, boolean force) {
         if (reception == null) {
             return;
         }
         while (!reception.pending.isEmpty()) {
             InboundPacket packet = reception.pending.firstEntry().getValue();
-            if (packet.sequence() != reception.nextSequence) {
+            int absent = packet.sequence() - reception.nextSequence;
+            if (absent > 0 && packet.isCorruptMedia()
+                    && reception.pending.values().stream().allMatch(InboundPacket::isCorruptMedia)) {
+                // A CRC-failed datagram alone cannot establish how many other slots were sent.
+                break;
+            }
+            if (absent > 0 || packet.isCorruptMedia()) {
                 if (!reception.waitingForGap) {
                     reception.waitingForGap = true;
                     reception.gapSince = packet.arrivedAt();
                 }
-                if (now - reception.gapSince < REORDER_NANOS
+                if (!force && now - reception.gapSince < REORDER_NANOS
                         && reception.pending.size() < REORDER_CAPACITY) {
                     break;
                 }
-                missing += packet.sequence() - reception.nextSequence;
+            }
+            if (absent > 0) {
+                missing += absent;
+                reportGap(reception.nextSequence, absent, false);
             }
             reception.pending.pollFirstEntry();
             reception.nextSequence = packet.sequence() + 1;
@@ -446,11 +557,19 @@ public final class UdpTransceiver implements AutoCloseable {
                 finishReception(now);
                 return;
             }
-            listener.onFrame(packet.type(), packet.sequence(), packet.payload());
+            if (packet.isCorruptMedia()) {
+                reportGap(packet.sequence(), 1, true);
+            } else {
+                reception.deliveredMedia = true;
+                reception.lastMediaTimestamp = packet.timestamp();
+                listener.onFrame(packet.type(), packet.sequence(), packet.payload(), reception.format.mode());
+            }
         }
-        if (now - reception.lastActivity >= WATCHDOG_NANOS) {
-            finishReception(now);
-            listener.onEvent("Canal liberado tras 300 ms sin tramas válidas");
+    }
+
+    private void reportGap(int sequence, int count, boolean corruptFrame) {
+        if (reception.format != null) {
+            listener.onFrameGap(reception.format.type(), sequence, count, corruptFrame);
         }
     }
 
@@ -487,14 +606,67 @@ public final class UdpTransceiver implements AutoCloseable {
         }
     }
 
-    private static byte[] encode(FrameType type, int sequence, long timestamp, byte[] payload) {
+    private static byte[] encode(FrameType type, int sequence, long timestamp, byte[] payload,
+                                 SignalModulator.Mode mode) {
         byte[] bytes = new byte[PACKET_BYTES];
         ByteBuffer packet = ByteBuffer.wrap(bytes);
         packet.put(type.code).putInt(sequence).putLong(timestamp);
         packet.position(HEADER_BYTES);
         packet.put(payload);
+        if (type == FrameType.AUDIO_FRAME && mode != SignalModulator.Mode.DSB_SC) {
+            writeVoiceMode(bytes, mode);
+        }
         packet.putLong(CHECKSUM_OFFSET, checksum(bytes));
         return bytes;
+    }
+
+    private static byte[] controlPayload(MediaFormat format) {
+        byte[] payload = new byte[PAYLOAD_BYTES];
+        int modeId = format.mode() == null ? 0 : format.mode().wireId();
+        ByteBuffer.wrap(payload).putInt(CONTROL_MAGIC).put(format.type().code).put((byte) modeId);
+        return payload;
+    }
+
+    private static MediaFormat controlFormat(byte[] bytes) {
+        ByteBuffer payload = ByteBuffer.wrap(bytes, HEADER_BYTES, PAYLOAD_BYTES);
+        if (payload.getInt() != CONTROL_MAGIC) {
+            return null;
+        }
+        FrameType type = FrameType.fromCode(payload.get());
+        SignalModulator.Mode mode = SignalModulator.Mode.fromWireId(Byte.toUnsignedInt(payload.get()));
+        if (type == FrameType.SSTV_FRAME) {
+            return SSTV;
+        }
+        return type == FrameType.AUDIO_FRAME && mode != null ? new MediaFormat(type, mode) : null;
+    }
+
+    // Repeating the mode inside PCM tolerates a missing START without changing the header.
+    // Each tagged signed sample changes by at most one unit; legacy voice remains bit-for-bit.
+    private static void writeVoiceMode(byte[] bytes, SignalModulator.Mode mode) {
+        long tag = VOICE_MODE_MARKER | mode.wireId();
+        for (int sample = 0; sample < Long.SIZE; sample++) {
+            int offset = pcmLowByteOffset(sample);
+            int bit = (int) (tag >>> (Long.SIZE - 1 - sample)) & 1;
+            bytes[offset] = (byte) ((bytes[offset] & 0xfe) | bit);
+        }
+    }
+
+    private static MediaFormat voiceFormat(byte[] bytes) {
+        long tag = 0;
+        for (int sample = 0; sample < Long.SIZE; sample++) {
+            tag = (tag << 1) | (bytes[pcmLowByteOffset(sample)] & 1);
+        }
+        if ((tag & ~VOICE_MODE_MASK) == VOICE_MODE_MARKER) {
+            SignalModulator.Mode mode = SignalModulator.Mode.fromWireId((int) (tag & VOICE_MODE_MASK));
+            if (mode != null) {
+                return new MediaFormat(FrameType.AUDIO_FRAME, mode);
+            }
+        }
+        return DEFAULT_VOICE;
+    }
+
+    private static int pcmLowByteOffset(int sample) {
+        return HEADER_BYTES + sample * Short.BYTES + 1;
     }
 
     private static long checksum(byte[] bytes) {
@@ -502,6 +674,22 @@ public final class UdpTransceiver implements AutoCloseable {
         crc.update(bytes, 0, CHECKSUM_OFFSET);
         crc.update(bytes, HEADER_BYTES, PAYLOAD_BYTES);
         return crc.getValue();
+    }
+
+    private static long[] payloadFlipSyndromes() {
+        // Inverting a payload byte changes the CRC by the same XOR for every packet
+        // of this length. Attribute only those CRC failures whose position is in PCM.
+        byte[] bytes = new byte[PACKET_BYTES];
+        long baseline = checksum(bytes);
+        long[] syndromes = new long[PAYLOAD_BYTES];
+        for (int index = 0; index < syndromes.length; index++) {
+            int offset = HEADER_BYTES + index;
+            bytes[offset] = (byte) 0xff;
+            syndromes[index] = baseline ^ checksum(bytes);
+            bytes[offset] = 0;
+        }
+        Arrays.sort(syndromes);
+        return syndromes;
     }
 
     private static Thread daemon(String name, Runnable task) {
@@ -557,7 +745,16 @@ public final class UdpTransceiver implements AutoCloseable {
     public interface Listener {
         default void onStateChanged(ChannelState state) { }
 
+        default void onSessionStarted(FrameType type, SignalModulator.Mode mode) { }
+
         default void onFrame(FrameType type, int sequence, byte[] payload) { }
+
+        default void onFrame(FrameType type, int sequence, byte[] payload, SignalModulator.Mode mode) {
+            onFrame(type, sequence, payload);
+        }
+
+        /** Reports unavailable media slots in order, with a one-based first sequence. */
+        default void onFrameGap(FrameType type, int firstSequence, int frameCount, boolean corrupt) { }
 
         default void onCorruptPacket(int total) { }
 
@@ -567,7 +764,8 @@ public final class UdpTransceiver implements AutoCloseable {
     }
 
     private static final class Transmission {
-        private final FrameType type;
+        private final MediaFormat format;
+        private final byte[] controlPayload;
         private final FrameSource source;
         private final long startedAt;
         private final Deque<OutboundPacket> outbox = new ArrayDeque<>();
@@ -576,8 +774,9 @@ public final class UdpTransceiver implements AutoCloseable {
         private long lastClaimAt;
         private boolean finished;
 
-        private Transmission(FrameType type, FrameSource source, long startedAt) {
-            this.type = type;
+        private Transmission(MediaFormat format, FrameSource source, long startedAt) {
+            this.format = format;
+            this.controlPayload = controlPayload(format);
             this.source = source;
             this.startedAt = startedAt;
             nextCapture = startedAt + FRAME_NANOS;
@@ -587,11 +786,14 @@ public final class UdpTransceiver implements AutoCloseable {
 
     private static final class Reception {
         private final NavigableMap<Integer, InboundPacket> pending = new TreeMap<>();
+        private MediaFormat format;
         private int nextSequence = 1;
         private boolean sawStart;
         private long startTimestamp;
         private long latestTimestamp;
         private long lastActivity;
+        private boolean deliveredMedia;
+        private long lastMediaTimestamp;
         private boolean waitingForGap;
         private long gapSince;
         private InboundPacket jitterReference;
@@ -602,8 +804,14 @@ public final class UdpTransceiver implements AutoCloseable {
         }
     }
 
+    private record MediaFormat(FrameType type, SignalModulator.Mode mode) { }
+
     private record OutboundPacket(byte[] bytes, long deadline) { }
 
     private record InboundPacket(FrameType type, int sequence, long timestamp, long arrivedAt,
-                                 byte[] payload) { }
+                                 byte[] payload, MediaFormat format) {
+        private boolean isCorruptMedia() {
+            return type.isMedia() && payload == null;
+        }
+    }
 }
