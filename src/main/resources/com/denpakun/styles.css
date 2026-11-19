@@ -128,7 +128,7 @@
     -fx-background-color: #285044;
 }
 
-.button.ptt:talking {
+.button.ptt.talking {
     -fx-background-color: #edb779;
     -fx-border-color: #edb779;
     -fx-text-fill: #2c1b0c;

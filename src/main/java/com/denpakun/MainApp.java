@@ -17,7 +17,6 @@ import javafx.animation.KeyFrame;
 import javafx.animation.Timeline;
 import javafx.application.Application;
 import javafx.application.Platform;
-import javafx.css.PseudoClass;
 import javafx.embed.swing.SwingFXUtils;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
@@ -57,7 +56,7 @@ public final class MainApp extends Application {
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final byte[] SILENCE = new byte[AudioEngine.FRAME_BYTES];
     private static final int LOG_LIMIT = 200;
-    private static final PseudoClass PRESSED = PseudoClass.getPseudoClass("talking");
+    private static final String TALKING_STYLE = "talking";
     private static final Color VOICE_COLOR = Color.web("#69dfbe");
     private static final Color CARRIER_COLOR = Color.web("#eab572");
 
@@ -507,7 +506,12 @@ public final class MainApp extends Application {
         peerInput.setDisable(current != null);
         connect.setText(current == null ? "Conectar" : ready ? "Desconectar" : "Cancelar");
         ptt.setDisable(!ready || state == ChannelState.RECEIVING || (state == ChannelState.TRANSMITTING && !talking));
-        ptt.pseudoClassStateChanged(PRESSED, talking);
+        var pttStyles = ptt.getStyleClass();
+        if (talking && !pttStyles.contains(TALKING_STYLE)) {
+            pttStyles.add(TALKING_STYLE);
+        } else if (!talking) {
+            pttStyles.remove(TALKING_STYLE);
+        }
         ptt.setText(talking ? "Transmitiendo voz" : state == ChannelState.RECEIVING
                 ? "Micrófono bloqueado" : "Mantén pulsado para hablar");
         chooseImage.setDisable(loadingImage || sending);
