@@ -15,10 +15,25 @@
     -fx-text-fill: #e1eeeb;
 }
 
+.app-window {
+    -fx-border-color: #2a3d40;
+}
+
+.title-bar {
+    -fx-background-color: #0c171b;
+    -fx-border-color: transparent transparent #294044 transparent;
+}
+
+.window-title {
+    -fx-padding: 0 0 0 14;
+    -fx-font-size: 12px;
+    -fx-text-fill: #a3b7b9;
+}
+
 .header {
     -fx-background-color: #111f23;
     -fx-border-color: transparent transparent #294044 transparent;
-    -fx-padding: 15 22;
+    -fx-padding: 11 22;
 }
 
 .brand {
@@ -161,6 +176,34 @@
 
 .button:focused, .button.primary-button:focused, .text-field:focused, .combo-box:focused {
     -fx-border-color: #d4f9ec;
+}
+
+.button.window-button {
+    -fx-pref-width: 44px;
+    -fx-pref-height: 32px;
+    -fx-background-color: transparent;
+    -fx-background-radius: 0;
+    -fx-border-radius: 0;
+    -fx-border-color: transparent;
+    -fx-padding: 0;
+    -fx-cursor: default;
+}
+
+.button.window-button:hover {
+    -fx-background-color: #24383c;
+}
+
+.button.window-button:focused {
+    -fx-border-color: #65d9ba;
+}
+
+.button.window-close:hover {
+    -fx-background-color: #983947;
+}
+
+.window-icon {
+    -fx-fill: transparent;
+    -fx-stroke: #e1eeeb;
 }
 
 .check-box > .box {

@@ -20,6 +20,7 @@ import javafx.animation.Timeline;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.embed.swing.SwingFXUtils;
+import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
 import javafx.scene.Scene;
@@ -37,6 +38,7 @@ import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextInputControl;
 import javafx.scene.control.Tooltip;
+import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.image.PixelFormat;
 import javafx.scene.image.WritableImage;
@@ -45,7 +47,9 @@ import javafx.scene.input.KeyEvent;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.ColumnConstraints;
 import javafx.scene.layout.FlowPane;
+import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
@@ -54,6 +58,7 @@ import javafx.scene.layout.VBox;
 import javafx.scene.paint.Color;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
+import javafx.stage.StageStyle;
 import javafx.util.Duration;
 
 public final class MainApp extends Application {
@@ -109,13 +114,24 @@ public final class MainApp extends Application {
 
     @Override
     public void start(Stage stage) {
+        stage.initStyle(StageStyle.UNDECORATED);
+        stage.setTitle("Denpa-Kun · Transceptor P2P");
+        String iconUrl = Objects.requireNonNull(getClass().getResource("denpa-kun.png")).toExternalForm();
+        Image appIcon = new Image(iconUrl, 128, 128, true, true);
+        stage.getIcons().setAll(new Image(iconUrl, 16, 16, true, true),
+                new Image(iconUrl, 32, 32, true, true), appIcon);
+        ImageView brandIcon = new ImageView(appIcon);
+        brandIcon.setFitWidth(48);
+        brandIcon.setFitHeight(48);
+        brandIcon.setPreserveRatio(true);
         Label brand = new Label("Denpa-Kun");
         brand.getStyleClass().add("brand");
         Label subtitle = new Label("Transceptor P2P · Voz y SSTV");
         subtitle.getStyleClass().add("muted");
         channel.getStyleClass().setAll("channel-state", "offline");
         connectionInfo.getStyleClass().add("muted");
-        VBox identity = new VBox(3, brand, subtitle);
+        HBox identity = new HBox(12, brandIcon, new VBox(3, brand, subtitle));
+        identity.setAlignment(Pos.CENTER_LEFT);
         VBox station = new VBox(6, channel, connectionInfo);
         station.setAlignment(Pos.CENTER_RIGHT);
         Region spacer = new Region();
@@ -124,36 +140,73 @@ public final class MainApp extends Application {
         header.setAlignment(Pos.CENTER_LEFT);
         header.getStyleClass().add("header");
 
-        VBox left = new VBox(14, buildLinkPanel(), buildFaultPanel(), buildLogPanel());
-        left.setPrefWidth(324);
-        left.setMinWidth(294);
-        VBox right = new VBox(14, buildSignalPanel(), buildImagePanel(stage));
-        right.setMinWidth(480);
-        HBox.setHgrow(right, Priority.ALWAYS);
-        HBox workspace = new HBox(14, left, right);
-        workspace.getStyleClass().add("workspace");
-        ScrollPane scroll = new ScrollPane(workspace);
-        scroll.setFitToWidth(true);
-        scroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
-        scroll.getStyleClass().add("workspace-scroll");
+        WindowChrome titleBar = new WindowChrome(stage);
         BorderPane root = new BorderPane();
-        root.setTop(header);
-        root.setCenter(scroll);
+        root.getStyleClass().add("app-window");
+        root.setTop(new VBox(titleBar, header));
+        root.setCenter(buildWorkspace(stage));
 
-        Scene scene = new Scene(root, 1060, 870);
+        Scene scene = new Scene(root);
         scene.getStylesheets().add(Objects.requireNonNull(getClass().getResource("styles.css")).toExternalForm());
+        titleBar.installResizeHandlers(scene);
         setupPtt(scene, stage);
         refreshControls();
         updateDashboard();
         dashboard = new Timeline(new KeyFrame(Duration.millis(50), event -> updateDashboard()));
         dashboard.setCycleCount(Timeline.INDEFINITE);
         dashboard.play();
-        stage.setTitle("Denpa-Kun · Transceptor P2P");
-        stage.setMinWidth(830);
-        stage.setMinHeight(580);
         stage.setScene(scene);
+        WindowChrome.sizeForScreen(stage);
         stage.show();
         peerInput.requestFocus();
+    }
+
+    private ScrollPane buildWorkspace(Stage stage) {
+        VBox link = buildLinkPanel();
+        VBox faultPanel = buildFaultPanel();
+        VBox log = buildLogPanel();
+        VBox signal = buildSignalPanel();
+        VBox images = buildImagePanel(stage);
+
+        VBox left = new VBox(14, link, faultPanel, log);
+        left.setPrefWidth(310);
+        left.setMinWidth(294);
+        left.setMaxWidth(Region.USE_PREF_SIZE);
+        VBox center = new VBox(14, signal, images);
+        center.setMinWidth(466);
+        center.setPrefWidth(540);
+        VBox right = new VBox(14);
+        right.setMinWidth(420);
+        right.setPrefWidth(450);
+        VBox.setVgrow(signal, Priority.ALWAYS);
+        VBox.setVgrow(images, Priority.ALWAYS);
+        VBox.setVgrow(log, Priority.ALWAYS);
+        HBox.setHgrow(center, Priority.ALWAYS);
+        HBox.setHgrow(right, Priority.ALWAYS);
+        HBox workspace = new HBox(14, left, center);
+        workspace.setAlignment(Pos.TOP_LEFT);
+        workspace.getStyleClass().add("workspace");
+        workspace.setMinHeight(Region.USE_PREF_SIZE);
+
+        ScrollPane scroll = new ScrollPane(workspace);
+        scroll.setFitToWidth(true);
+        scroll.setFitToHeight(true);
+        scroll.getStyleClass().add("workspace-scroll");
+        scroll.widthProperty().addListener((observable, previous, width) -> {
+            boolean wide = width.doubleValue() >= 1_270;
+            if (wide && images.getParent() == center) {
+                left.getChildren().remove(log);
+                center.getChildren().remove(images);
+                right.getChildren().addAll(images, log);
+                workspace.getChildren().add(right);
+            } else if (!wide && images.getParent() == right) {
+                workspace.getChildren().remove(right);
+                right.getChildren().clear();
+                center.getChildren().add(images);
+                left.getChildren().add(log);
+            }
+        });
+        return scroll;
     }
 
     private VBox buildLinkPanel() {
@@ -211,7 +264,7 @@ public final class MainApp extends Application {
     }
 
     private VBox buildLogPanel() {
-        events.setPrefHeight(181);
+        events.setPrefHeight(96);
         events.setPlaceholder(new Label("Sin eventos"));
         events.setCellFactory(list -> new ListCell<>() {
             @Override
@@ -224,6 +277,7 @@ public final class MainApp extends Application {
                 }
             }
         });
+        VBox.setVgrow(events, Priority.ALWAYS);
         return panel("Eventos", events);
     }
 
@@ -252,37 +306,60 @@ public final class MainApp extends Application {
         HBox actions = new HBox(8, chooseImage, sendImage, tones);
         actions.setAlignment(Pos.CENTER_LEFT);
         imageProgress.setMaxWidth(Double.MAX_VALUE);
-        VBox transmit = imageTile("Vista previa", outgoingPreview, "Sin imagen", imageInfo);
-        VBox receive = imageTile("Recepción", incomingPreview, "Sin imagen", receiveInfo);
+        StackPane transmit = imageScreen(outgoingPreview);
+        StackPane receive = imageScreen(incomingPreview);
         receiveInfo.getStyleClass().add("image-receive-info");
         FlowPane imageKey = new FlowPane(10, 3, legend("Píxeles sin datos", "frame-lost"),
                 legend("Sin pulso de sincronía", "frame-corrupt"));
-        receive.getChildren().add(imageKey);
-        HBox images = new HBox(10, transmit, receive);
-        HBox.setHgrow(transmit, Priority.ALWAYS);
-        HBox.setHgrow(receive, Priority.ALWAYS);
+
+        GridPane images = new GridPane(10, 5);
+        ColumnConstraints outgoingColumn = new ColumnConstraints();
+        outgoingColumn.setPercentWidth(50);
+        ColumnConstraints incomingColumn = new ColumnConstraints();
+        incomingColumn.setPercentWidth(50);
+        images.getColumnConstraints().addAll(outgoingColumn, incomingColumn);
+        images.addRow(0, new Label("Vista previa"), new Label("Recepción"));
+        images.addRow(1, transmit, receive);
+        images.addRow(2, imageCaption(imageInfo), imageCaption(receiveInfo));
+        images.add(imageKey, 1, 3);
+        GridPane.setVgrow(transmit, Priority.ALWAYS);
+        GridPane.setVgrow(receive, Priority.ALWAYS);
+        VBox.setVgrow(images, Priority.ALWAYS);
         return panel("Imágenes SSTV", actions, images, imageProgress);
     }
 
-    private static VBox imageTile(String title, ImageView view, String placeholder, Label caption) {
-        view.setFitWidth(192);
-        view.setFitHeight(144);
+    private static StackPane imageScreen(ImageView view) {
+        view.setManaged(false);
         view.setPreserveRatio(true);
         view.setSmooth(false);
-        Label empty = new Label(placeholder);
+        Label empty = new Label("Sin imagen");
         empty.getStyleClass().add("muted");
         empty.visibleProperty().bind(view.imageProperty().isNull());
-        StackPane screen = new StackPane(empty, view);
+        StackPane screen = new StackPane(empty, view) {
+            @Override
+            protected void layoutChildren() {
+                super.layoutChildren();
+                Insets insets = getInsets();
+                double width = Math.max(1, getWidth() - insets.getLeft() - insets.getRight());
+                double height = Math.max(1, getHeight() - insets.getTop() - insets.getBottom());
+                view.setFitWidth(width);
+                view.setFitHeight(height);
+                view.relocate(insets.getLeft() + (width - view.getLayoutBounds().getWidth()) / 2,
+                        insets.getTop() + (height - view.getLayoutBounds().getHeight()) / 2);
+            }
+        };
         screen.setMinHeight(144);
         screen.getStyleClass().add("image-screen");
+        view.imageProperty().addListener((observable, previous, image) -> screen.requestLayout());
+        return screen;
+    }
+
+    private static Label imageCaption(Label caption) {
         caption.getStyleClass().add("muted");
         caption.setWrapText(true);
         caption.setTooltip(new Tooltip());
         caption.getTooltip().textProperty().bind(caption.textProperty());
-        VBox tile = new VBox(5, new Label(title), screen, caption);
-        tile.setFillWidth(true);
-        tile.setPrefWidth(240);
-        return tile;
+        return caption;
     }
 
     private static VBox panel(String title, Node... content) {
@@ -305,7 +382,10 @@ public final class MainApp extends Application {
 
     private static VBox scope(Label label, SignalScope scope, String colorClass) {
         label.getStyleClass().add(colorClass);
-        return new VBox(4, label, scope);
+        VBox.setVgrow(scope, Priority.ALWAYS);
+        VBox content = new VBox(4, label, scope);
+        VBox.setVgrow(content, Priority.ALWAYS);
+        return content;
     }
 
     private static HBox legend(String title, String colorClass) {
